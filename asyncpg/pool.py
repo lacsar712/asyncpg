@@ -19,6 +19,7 @@ import weakref
 from . import compat
 from . import connection
 from . import exceptions
+from . import policy
 from . import protocol
 
 
@@ -220,7 +221,9 @@ class PoolConnectionHolder:
 
         return proxy
 
-    async def release(self, timeout: Optional[float]) -> None:
+    async def release(
+        self, timeout: Optional[float], *, force_drop: bool = False
+    ) -> None:
         if self._in_use is None:
             raise exceptions.InternalClientError(
                 'PoolConnectionHolder.release() called on '
@@ -231,6 +234,13 @@ class PoolConnectionHolder:
             # Connection._cleanup().  Terminate it to finish cleanup and
             # return the holder to the pool via _release_on_close().
             self._con.terminate()
+            return
+
+        if force_drop:
+            # A force_drop conn-return frame forbids recycling: close
+            # the underlying connection and let the pool reconnect the
+            # holder on a subsequent acquire.
+            await self._con.close(timeout=timeout)
             return
 
         self._timeout = None
@@ -283,6 +293,22 @@ class PoolConnectionHolder:
                     self._con.terminate()
             finally:
                 raise ex
+
+        # The conn-return decision reads the stack at the actual
+        # recycle point, not the frame seen when release() started:
+        # a keep_out/force_drop frame pushed while we were waiting on
+        # cancellation or running a user `reset` callback must take
+        # effect.  keep_out rejects explicitly instead of silently
+        # recycling with the stale frame; force_drop closes instead of
+        # returning the connection to the pool.
+        mode = policy.effective_conn_return()
+        if mode == policy.KEEP_OUT:
+            raise exceptions.ConnectionReturnRejectedError(
+                "conn_return='keep_out' is active: Pool.release() "
+                "was rejected; the connection remains checked out")
+        if mode == policy.FORCE_DROP:
+            await self._con.close(timeout=timeout)
+            return
 
         # Free this connection holder and invalidate the
         # connection proxy.
@@ -1042,6 +1068,16 @@ class Pool:
 
         self._check_init()
 
+        # Read the conn-return axis at entry (before any housekeeping
+        # or blocking), so the caller never sees a fake successful
+        # return while a keep_out frame is active.
+        conn_return = policy.effective_conn_return()
+        if conn_return == policy.KEEP_OUT:
+            raise exceptions.ConnectionReturnRejectedError(
+                "conn_return='keep_out' is active: Pool.release() "
+                "was rejected; the connection remains checked out and "
+                "in use")
+
         # Let the connection do its internal housekeeping when its released.
         connection._con._on_release()
 
@@ -1052,7 +1088,8 @@ class Pool:
         # Use asyncio.shield() to guarantee that task cancellation
         # does not prevent the connection from being returned to the
         # pool properly.
-        return await asyncio.shield(ch.release(timeout))
+        return await asyncio.shield(
+            ch.release(timeout, force_drop=conn_return == policy.FORCE_DROP))
 
     async def close(self):
         """Attempt to gracefully close all connections in the pool.

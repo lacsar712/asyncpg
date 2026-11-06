@@ -15,7 +15,9 @@ __all__ = ('PostgresError', 'FatalPostgresError', 'UnknownPostgresError',
            'ClientConfigurationError',
            'InternalClientError', 'OutdatedSchemaCacheError', 'ProtocolError',
            'UnsupportedClientFeatureError', 'TargetServerAttributeNotMatched',
-           'UnsupportedServerFeatureError')
+           'UnsupportedServerFeatureError',
+           'PolicyError', 'ExecutionAdmissionError',
+           'ConnectionReturnRejectedError')
 
 
 def _is_asyncpg_class(cls):
@@ -232,6 +234,29 @@ class DataError(InterfaceError, ValueError):
 
 class UnsupportedClientFeatureError(InterfaceError):
     """Requested feature is unsupported by asyncpg."""
+
+
+class PolicyError(InterfaceError):
+    """An operation was rejected by the runtime execution-policy stack."""
+
+
+class ExecutionAdmissionError(PolicyError):
+    """A statement or cursor result fetch was rejected by ``exec_admit``.
+
+    Raised when a ``deny_new`` frame is active, or when a ``one_more``
+    frame has already admitted its single statement.  The rejection
+    happens before anything is sent to the server; an already in-flight
+    execution is never cancelled or rewritten to a fake success.
+    """
+
+
+class ConnectionReturnRejectedError(PolicyError):
+    """A pool release was rejected by a ``keep_out`` conn-return frame.
+
+    The connection remains checked out to its caller instead of
+    silently returning to the pool (or instead of a later borrower
+    receiving a phantom idle connection).
+    """
 
 
 class UnsupportedServerFeatureError(InterfaceError):

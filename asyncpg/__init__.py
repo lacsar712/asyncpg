@@ -8,6 +8,17 @@ from __future__ import annotations
 
 from .connection import connect, Connection  # NOQA
 from .exceptions import *  # NOQA
+from .policy import (  # NOQA
+    policy_scope,
+    effective_policy,
+    HONOR_CFG,
+    DENY_NEW,
+    ONE_MORE,
+    FREEZE,
+    SHRINK_NOW,
+    KEEP_OUT,
+    FORCE_DROP,
+)
 from .pool import create_pool, Pool  # NOQA
 from .protocol import Record  # NOQA
 from .types import *  # NOQA
@@ -15,10 +26,14 @@ from .types import *  # NOQA
 
 from ._version import __version__  # NOQA
 
-from . import exceptions
+from . import exceptions  # NOQA
+from . import policy  # NOQA
 
 
 __all__: tuple[str, ...] = (
-    'connect', 'create_pool', 'Pool', 'Record', 'Connection'
+    'connect', 'create_pool', 'Pool', 'Record', 'Connection',
+    'policy_scope', 'effective_policy',
+    'HONOR_CFG', 'DENY_NEW', 'ONE_MORE', 'FREEZE', 'SHRINK_NOW',
+    'KEEP_OUT', 'FORCE_DROP',
 )
 __all__ += exceptions.__all__ # NOQA

@@ -324,7 +324,13 @@ cdef class BaseProtocol(CoreProtocol):
             return await waiter
 
     async def query(self, query, timeout):
-        timeout = self._get_timeout(timeout)
+        if timeout is NO_TIMEOUT:
+            # The timeout has already been merged with the connection's
+            # command_timeout in Python and a freeze frame removed the
+            # deadline: do not fall back to command_timeout here.
+            timeout = None
+        else:
+            timeout = self._get_timeout(timeout)
         timeout = await self._wait_for_cancellation(timeout)
 
         self._check_state()

@@ -11,6 +11,7 @@ import typing
 from . import connresource
 from . import cursor
 from . import exceptions
+from . import policy
 
 
 class PreparedStatement(connresource.ConnectionResource):
@@ -174,6 +175,7 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: A list of :class:`Record` instances.
         """
+        policy.admit_statement('prepared_statement.fetch')
         data = await self.__bind_execute(args, 0, timeout)
         return data
 
@@ -191,6 +193,7 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: The value of the specified column of the first record.
         """
+        policy.admit_statement('prepared_statement.fetchval')
         data = await self.__bind_execute(args, 1, timeout)
         if not data:
             return None
@@ -206,6 +209,7 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: The first row as a :class:`Record` instance.
         """
+        policy.admit_statement('prepared_statement.fetchrow')
         data = await self.__bind_execute(args, 1, timeout)
         if not data:
             return None
@@ -222,6 +226,8 @@ class PreparedStatement(connresource.ConnectionResource):
 
         .. versionadded:: 0.30.0
         """
+        policy.admit_statement('prepared_statement.fetchmany')
+        timeout = self._connection._resolve_command_timeout(timeout)
         return await self.__do_execute(
             lambda protocol: protocol.bind_execute_many(
                 self._state,
@@ -242,6 +248,8 @@ class PreparedStatement(connresource.ConnectionResource):
 
         .. versionadded:: 0.22.0
         """
+        policy.admit_statement('prepared_statement.executemany')
+        timeout = self._connection._resolve_command_timeout(timeout)
         return await self.__do_execute(
             lambda protocol: protocol.bind_execute_many(
                 self._state,
@@ -265,6 +273,7 @@ class PreparedStatement(connresource.ConnectionResource):
             raise
 
     async def __bind_execute(self, args, limit, timeout):
+        timeout = self._connection._resolve_command_timeout(timeout)
         data, status, _ = await self.__do_execute(
             lambda protocol: protocol.bind_execute(
                 self._state, args, '', limit, True, timeout))

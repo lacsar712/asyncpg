@@ -9,6 +9,7 @@ import collections
 
 from . import connresource
 from . import exceptions
+from . import policy
 
 
 class CursorFactory(connresource.ConnectionResource):
@@ -115,6 +116,11 @@ class BaseCursor(connresource.ConnectionResource):
             raise exceptions.NoActiveSQLTransactionError(
                 'cursor cannot be created outside of a transaction')
 
+    def _resolve_roundtrip_timeout(self, timeout):
+        # Read the timeout gate *at this roundtrip*, so nested scopes
+        # and freeze/shrink pushes take effect for the next fetch.
+        return self._connection._resolve_command_timeout(timeout)
+
     async def _bind_exec(self, n, timeout):
         self._check_ready()
 
@@ -127,7 +133,8 @@ class BaseCursor(connresource.ConnectionResource):
 
         self._portal_name = con._get_unique_id('portal')
         buffer, _, self._exhausted = await protocol.bind_execute(
-            self._state, self._args, self._portal_name, n, True, timeout)
+            self._state, self._args, self._portal_name, n, True,
+            self._resolve_roundtrip_timeout(timeout))
         return buffer
 
     async def _bind(self, timeout):
@@ -143,7 +150,7 @@ class BaseCursor(connresource.ConnectionResource):
         self._portal_name = con._get_unique_id('portal')
         buffer = await protocol.bind(self._state, self._args,
                                      self._portal_name,
-                                     timeout)
+                                     self._resolve_roundtrip_timeout(timeout))
         return buffer
 
     async def _exec(self, n, timeout):
@@ -155,7 +162,8 @@ class BaseCursor(connresource.ConnectionResource):
 
         protocol = self._connection._protocol
         buffer, _, self._exhausted = await protocol.execute(
-            self._state, self._portal_name, n, True, timeout)
+            self._state, self._portal_name, n, True,
+            self._resolve_roundtrip_timeout(timeout))
         return buffer
 
     async def _close_portal(self, timeout):
@@ -166,7 +174,8 @@ class BaseCursor(connresource.ConnectionResource):
                 'cursor does not have an open portal')
 
         protocol = self._connection._protocol
-        await protocol.close_portal(self._portal_name, timeout)
+        await protocol.close_portal(
+            self._portal_name, self._resolve_roundtrip_timeout(timeout))
         self._portal_name = None
 
     def __repr__(self):
@@ -221,10 +230,23 @@ class CursorIterator(BaseCursor):
 
     @connresource.guarded
     async def __anext__(self):
+        # Admit before any network op.  Rows already materialized in
+        # the buffer need no admission and keep flowing; a later call
+        # that has to ask the server for another batch is gated.
+        needs_roundtrip = (
+            self._state is None
+            or (not self._portal_name and not self._exhausted)
+            or (not self._buffer and not self._exhausted)
+            or (self._portal_name and self._exhausted
+                and not self._buffer)
+        )
+        if needs_roundtrip:
+            policy.admit_statement('cursor.__anext__')
+
         if self._state is None:
             self._state = await self._connection._get_statement(
                 self._query,
-                self._timeout,
+                self._resolve_roundtrip_timeout(self._timeout),
                 named=True,
                 record_class=self._record_class,
             )
@@ -253,10 +275,11 @@ class Cursor(BaseCursor):
     __slots__ = ()
 
     async def _init(self, timeout):
+        policy.admit_statement('cursor')
         if self._state is None:
             self._state = await self._connection._get_statement(
                 self._query,
-                timeout,
+                self._resolve_roundtrip_timeout(timeout),
                 named=True,
                 record_class=self._record_class,
             )
@@ -278,6 +301,7 @@ class Cursor(BaseCursor):
             raise exceptions.InterfaceError('n must be greater than zero')
         if self._exhausted:
             return []
+        policy.admit_statement('cursor.fetch')
         recs = await self._exec(n, timeout)
         if len(recs) < n:
             self._exhausted = True
@@ -294,6 +318,7 @@ class Cursor(BaseCursor):
         self._check_ready()
         if self._exhausted:
             return None
+        policy.admit_statement('cursor.fetchrow')
         recs = await self._exec(1, timeout)
         if len(recs) < 1:
             self._exhausted = True
@@ -312,9 +337,11 @@ class Cursor(BaseCursor):
         if n <= 0:
             raise exceptions.InterfaceError('n must be greater than zero')
 
+        policy.admit_statement('cursor.forward')
         protocol = self._connection._protocol
         status = await protocol.query('MOVE FORWARD {:d} {}'.format(
-            n, self._portal_name), timeout)
+            n, self._portal_name),
+            self._resolve_roundtrip_timeout(timeout))
 
         advanced = int(status.split()[1])
         if advanced < n:

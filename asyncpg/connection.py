@@ -26,6 +26,7 @@ from . import connect_utils
 from . import cursor
 from . import exceptions
 from . import introspection
+from . import policy
 from . import prepared_stmt
 from . import protocol
 from . import serverversion
@@ -368,13 +369,20 @@ class Connection(metaclass=ConnectionMeta):
            Made it possible to pass query arguments.
         """
         self._check_open()
+        policy.admit_statement('execute')
 
         if not args:
+            # The simple-query protocol entry merges the permanent
+            # command_timeout itself, so resolve the runtime timeout
+            # gate here; a freeze frame yields NO_TIMEOUT.
+            resolved_timeout = self._resolve_command_timeout(timeout)
             if self._query_loggers:
                 with self._time_and_log(query, args, timeout):
-                    result = await self._protocol.query(query, timeout)
+                    result = await self._protocol.query(
+                        query, resolved_timeout)
             else:
-                result = await self._protocol.query(query, timeout)
+                result = await self._protocol.query(
+                    query, resolved_timeout)
             return result
 
         _, status, _ = await self._execute(
@@ -421,6 +429,7 @@ class Connection(metaclass=ConnectionMeta):
            ``executemany()`` was called in a transaction.
         """
         self._check_open()
+        policy.admit_statement('executemany')
         return await self._executemany(command, args, timeout)
 
     async def _get_statement(
@@ -714,6 +723,7 @@ class Connection(metaclass=ConnectionMeta):
             Added the *record_class* parameter.
         """
         self._check_open()
+        policy.admit_statement('fetch')
         return await self._execute(
             query,
             args,
@@ -738,6 +748,7 @@ class Connection(metaclass=ConnectionMeta):
                  None if no records were returned by the query.
         """
         self._check_open()
+        policy.admit_statement('fetchval')
         data = await self._execute(query, args, 1, timeout)
         if not data:
             return None
@@ -772,6 +783,7 @@ class Connection(metaclass=ConnectionMeta):
             Added the *record_class* parameter.
         """
         self._check_open()
+        policy.admit_statement('fetchrow')
         data = await self._execute(
             query,
             args,
@@ -822,6 +834,7 @@ class Connection(metaclass=ConnectionMeta):
         .. versionadded:: 0.30.0
         """
         self._check_open()
+        policy.admit_statement('fetchmany')
         return await self._executemany(
             query, args, timeout, return_rows=True, record_class=record_class
         )
@@ -1912,6 +1925,25 @@ class Connection(metaclass=ConnectionMeta):
             )
         return result
 
+    def _resolve_command_timeout(self, timeout):
+        """Merge the permanent command_timeout, the call argument and
+        the current timeout gate.
+
+        Returns a float budget, or ``protocol.NO_TIMEOUT`` when there is
+        no deadline (no configured timeout, or an active ``freeze``
+        frame).  The permanent connection configuration is only read,
+        never mutated.
+        """
+        if timeout is protocol.NO_TIMEOUT:
+            # Already merged and gated (e.g. type introspection issued
+            # from within a frozen accepted execution).
+            return protocol.NO_TIMEOUT
+        merged = self._protocol._get_timeout(timeout)
+        resolved = policy.resolve_command_timeout(merged)
+        if resolved is None:
+            return protocol.NO_TIMEOUT
+        return resolved
+
     @contextlib.contextmanager
     def query_logger(self, callback):
         """Context manager that adds `callback` to the list of query loggers,
@@ -1989,9 +2021,11 @@ class Connection(metaclass=ConnectionMeta):
             return_extra=return_status,
             timeout=timeout,
         )
-        timeout = self._protocol._get_timeout(timeout)
+        timeout = self._resolve_command_timeout(timeout)
+        log_timeout = (
+            None if timeout is protocol.NO_TIMEOUT else timeout)
         if self._query_loggers:
-            with self._time_and_log(query, args, timeout):
+            with self._time_and_log(query, args, log_timeout):
                 result, stmt = await self._do_execute(
                     query,
                     executor,
@@ -2024,9 +2058,11 @@ class Connection(metaclass=ConnectionMeta):
             timeout=timeout,
             return_rows=return_rows,
         )
-        timeout = self._protocol._get_timeout(timeout)
+        timeout = self._resolve_command_timeout(timeout)
+        log_timeout = (
+            None if timeout is protocol.NO_TIMEOUT else timeout)
         with self._stmt_exclusive_section:
-            with self._time_and_log(query, args, timeout):
+            with self._time_and_log(query, args, log_timeout):
                 result, _ = await self._do_execute(
                     query, executor, timeout, record_class=record_class
                 )
@@ -2042,10 +2078,16 @@ class Connection(metaclass=ConnectionMeta):
         ignore_custom_codec=False,
         record_class=None
     ):
-        if timeout is None:
+        # `protocol.NO_TIMEOUT` is the resolved "no deadline" token,
+        # produced either by a freeze frame or by the absence of a
+        # configured command timeout.
+        no_deadline = (
+            timeout is None or timeout is protocol.NO_TIMEOUT)
+
+        if no_deadline:
             stmt = await self._get_statement(
                 query,
-                None,
+                protocol.NO_TIMEOUT,
                 record_class=record_class,
                 ignore_custom_codec=ignore_custom_codec,
             )
@@ -2062,8 +2104,8 @@ class Connection(metaclass=ConnectionMeta):
             before = after
 
         try:
-            if timeout is None:
-                result = await executor(stmt, None)
+            if no_deadline:
+                result = await executor(stmt, protocol.NO_TIMEOUT)
             else:
                 try:
                     result = await executor(stmt, timeout)
